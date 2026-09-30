@@ -8,3 +8,6 @@ I know there will be a lot of potential errors in this code and if someone knows
 
 Architecture Inspiration - GPT2 decoder only architecture
 Goals I want to achieve - make a 1 layer transformer architecture trying to replicate the decode process
+
+24/09 DAY1 - implemented the current embedding plus wrote some code for ffn and attention don't know if it works or not plus the current embeddings are very simple they are just one hot encoding of characters
+30/9 - implemented the mlp and ffn, testing the final outputs

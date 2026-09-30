@@ -35,20 +35,38 @@ will project down the dimensions as well
 '''
 class MLP:
     def __init__(self,rows,cols,bias=None):
-        self.rows = rows
         self.cols = cols
-        self.weightMatrix = np.random.rand(rows,cols)
+        self.weightMatrix = np.random.rand(cols,4*cols)
         if bias:
-            self.biasMatrix = np.random.rand(1,cols)
+            self.biasMatrix = np.random.rand(rows,4*cols)
         else:
             self.biasMatrix = None
-        self.computedScaledAttention = None
-    def forward(self,computedDotAttentionMat,OriginalMatafterLayerNorm1):
-        self.computedScaledAttention = computedAttentionMat @ self.weightMatrix
-        if self.biasMatrix:
+        self.weighDownMat = np.random.rand(4*cols,cols)
+        # self.computedScaledAttention = None
+    def layer_norm(self,x, gamma, beta, eps=1e-5):
+      mean = x.mean(axis=-1, keepdims=True)
+      var = x.var(axis=-1, keepdims=True)  # population variance
+      return (x - mean) / np.sqrt(var + eps)
+    def gelu(self, x):
+        return 0.5 * x * (
+            1.0 + np.tanh(
+                np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)
+            )
+        )
+    def forward(self,context):
+        context = self.layer_norm(context,0,0)
+        print(context.shape,self.weightMatrix.shape,self.biasMatrix.shape)
+        self.computedScaledAttention = context @ self.weightMatrix
+        print(self.computedScaledAttention.shape)
+        if self.biasMatrix is not None:
             self.computedScaledAttention += self.biasMatrix
+        self.computedScaledAttention = self.gelu(
+            self.computedScaledAttention
+        )
         #question is how to add OriginalMatrix here since we have increased the size of our Matrix during feed forward step
-        return self.computedScaledAttention
+        #next is to bring it down to vocab size
+        out = self.computedScaledAttention @ self.weighDownMat
+        return out
     
         
     
@@ -102,10 +120,28 @@ if __name__ == "__main__":
     rows,cols = embeddedText.shape[0],embeddedText.shape[1]
     AttentionCls = ComputeAttention(model_dim=cols)
     ret = AttentionCls.computeAttention(embeddedText)
-    print(ret)
+    LinearMlp = MLP(ret.shape[0],ret.shape[1],bias=True)
+    output = LinearMlp.forward(ret)
+    # Token ID 0 means "a", 1 means "b", etc.
+    vocabulary = "abcdefghijklmnopqrstuvwxyz"
+    vocab_size = len(vocabulary)
+    model_dim = output.shape[-1]
+    rng = np.random.default_rng(42)
+    W_vocab = rng.normal(
+        loc=0.0,
+        scale=0.02,
+        size=(model_dim, vocab_size),
+    )
+    logits = output @ W_vocab
+    next_character_scores = logits[-1]
+    next_character_id = int(np.argmax(next_character_scores))
+    next_character = vocabulary[next_character_id]
+
+    print("Next character:", next_character)
+    print("Updated text:", text + next_character)
 
 
-    #next step is attention
+
 
 
 
