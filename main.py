@@ -1,149 +1,166 @@
+"""Small NumPy decoder blocks with explicit backward passes.
+
+Inputs are (sequence_length, model_dim) arrays. Each forward call caches
+one sequence for its subsequent backward call.
+"""
 import numpy as np
-import math
 
-'''
-should accept the entire word that we are trying to tokenize and return the np.array for that particular word
-'''
+
+def matmul(left, right):
+    """2-D product without the macOS Accelerate matmul warning issue."""
+    return np.einsum('ij,jk->ik', left, right, optimize=False)
+
+
 class ConvertToEmbeddings:
-    def __init__(self,positionalEmbeddings=None):
+    """Legacy one-hot demo encoder; training uses its own fixed vocabulary."""
+    def __init__(self, positionalEmbeddings=None):
         self.positionalEmbeddings = positionalEmbeddings
-    def embedText(self,text:str)->np.array:
-        n = len(text)
-        arr = []
-        for char in text:
-        #possibilites are a-z, A-Z and 0-9, not taking any special characters here keeping v1 simple 
-        #also omitting spaces as of now because do not know how to handle it yet
-            if char.isdigit():
-                currentId = ord(char) - ord('0')
-            if char == " ":
-                continue
-            currentId = ord(char) - ord('a')
-            arr.append(currentId)
-        for idx,embedding in enumerate(arr):
-            arr[idx] = idx + embedding
-        #add more ways to add positional embeddings here, tbd in the future
-        embeddingArray = []
-        for num in arr:
-            currArray  = [0] * 26
-            currArray[num%26] = 1
-            embeddingArray.append(currArray)
-        return np.array(embeddingArray)
 
-'''
-for now keeping the attention block simple with q,k and v matrices equal to dimension of text
-will project down the dimensions as well
-'''
+    def embedText(self, text):
+        ids = [ord(char) - ord('a') for char in text if 'a' <= char <= 'z']
+        return np.eye(26)[ids]
+
+
+class LayerNorm:
+    def __init__(self, model_dim, eps=1e-5):
+        self.gamma = np.ones(model_dim)
+        self.beta = np.zeros(model_dim)
+        self.eps = eps
+        self.params = {'gamma': self.gamma, 'beta': self.beta}
+        self.grads = {name: np.zeros_like(value) for name, value in self.params.items()}
+
+    def forward(self, x):
+        centered = x - x.mean(axis=-1, keepdims=True)
+        self.inv_std = 1.0 / np.sqrt((centered**2).mean(axis=-1, keepdims=True) + self.eps)
+        self.normalized = centered * self.inv_std
+        return self.normalized * self.gamma + self.beta
+
+    def backward(self, grad_output):
+        self.grads['gamma'] += (grad_output * self.normalized).sum(axis=0)
+        self.grads['beta'] += grad_output.sum(axis=0)
+        grad = grad_output * self.gamma
+        return self.inv_std * (
+            grad - grad.mean(axis=-1, keepdims=True)
+            - self.normalized * (grad * self.normalized).mean(axis=-1, keepdims=True)
+        )
+
+
 class MLP:
-    def __init__(self,rows,cols,bias=None):
+    def __init__(self, rows=None, cols=None, bias=True, rng=None):
+        # rows remains accepted; parameters are shared across positions.
+        if cols is None or cols <= 0:
+            raise ValueError('cols must be a positive embedding width')
+        rng = rng if rng is not None else np.random.default_rng()
         self.cols = cols
-        self.weightMatrix = np.random.rand(cols,4*cols)
+        self.weightMatrix = rng.normal(0.0, 0.02, (cols, 4 * cols))
+        self.weighDownMat = rng.normal(0.0, 0.02, (4 * cols, cols))
+        self.biasMatrix = np.zeros(4 * cols) if bias else None
+        self.downBias = np.zeros(cols) if bias else None
+        self.params = {'up_weight': self.weightMatrix, 'down_weight': self.weighDownMat}
         if bias:
-            self.biasMatrix = np.random.rand(rows,4*cols)
-        else:
-            self.biasMatrix = None
-        self.weighDownMat = np.random.rand(4*cols,cols)
-        # self.computedScaledAttention = None
-    def layer_norm(self,x, gamma, beta, eps=1e-5):
-      mean = x.mean(axis=-1, keepdims=True)
-      var = x.var(axis=-1, keepdims=True)  # population variance
-      return (x - mean) / np.sqrt(var + eps)
-    def gelu(self, x):
-        return 0.5 * x * (
-            1.0 + np.tanh(
-                np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)
-            )
-        )
-    def forward(self,context):
-        context = self.layer_norm(context,0,0)
-        print(context.shape,self.weightMatrix.shape,self.biasMatrix.shape)
-        self.computedScaledAttention = context @ self.weightMatrix
-        print(self.computedScaledAttention.shape)
+            self.params.update(up_bias=self.biasMatrix, down_bias=self.downBias)
+        self.grads = {name: np.zeros_like(value) for name, value in self.params.items()}
+
+    @staticmethod
+    def gelu(x):
+        return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)))
+
+    @staticmethod
+    def gelu_derivative(x):
+        scale = np.sqrt(2.0 / np.pi)
+        tanh = np.tanh(scale * (x + 0.044715 * x**3))
+        return (0.5 * (1.0 + tanh)
+                + 0.5 * x * (1.0 - tanh**2) * scale * (1.0 + 3.0 * 0.044715 * x**2))
+
+    def forward(self, context):
+        self.input = context
+        self.hidden = matmul(context, self.weightMatrix)
         if self.biasMatrix is not None:
-            self.computedScaledAttention += self.biasMatrix
-        self.computedScaledAttention = self.gelu(
-            self.computedScaledAttention
-        )
-        #question is how to add OriginalMatrix here since we have increased the size of our Matrix during feed forward step
-        #next is to bring it down to vocab size
-        out = self.computedScaledAttention @ self.weighDownMat
+            self.hidden = self.hidden + self.biasMatrix
+        self.computedScaledAttention = self.gelu(self.hidden)
+        out = matmul(self.computedScaledAttention, self.weighDownMat)
+        if self.downBias is not None:
+            out = out + self.downBias
         return out
-    
-        
-    
+
+    def backward(self, grad_output):
+        self.grads['down_weight'] += matmul(self.computedScaledAttention.T, grad_output)
+        grad_hidden = matmul(grad_output, self.weighDownMat.T) * self.gelu_derivative(self.hidden)
+        self.grads['up_weight'] += matmul(self.input.T, grad_hidden)
+        if self.biasMatrix is not None:
+            self.grads['down_bias'] += grad_output.sum(axis=0)
+            self.grads['up_bias'] += grad_hidden.sum(axis=0)
+        return matmul(grad_hidden, self.weightMatrix.T)
+
+
 class ComputeAttention:
-    def __init__(self,model_dim,key_dim=None):
-        # The projection dimensions depend on the embedding width, not the
-        # number of tokens in the current input.
+    """One causal attention head, including an output projection."""
+    def __init__(self, model_dim, key_dim=None, rng=None):
         self.model_dim = model_dim
-        self.key_dim = key_dim or model_dim
-        self.Q = np.random.rand(model_dim,self.key_dim)
-        self.K = np.random.rand(model_dim,self.key_dim)
-        self.V = np.random.rand(model_dim,self.key_dim)
-    def calculateExponential(self,attentionScores):
-        attentionScoreExp = []
-        rowSum = []
-        for idx,row in enumerate(attentionScores,0):
-            sum_xp = 0
-            for val in row:
-                sum_xp += np.exp(val)
-            rowSum.append(sum_xp)
-        
-        for i,row in enumerate(attentionScores,0):
-            currRow = []
-            for val in row:
-                if val == -np.inf:
-                    currRow.append(0.0)
-                else:
-                    currRow.append(np.exp(val)/rowSum[i])
-            currRow = np.array(currRow,dtype=np.float32)
-            attentionScoreExp.append(currRow)
-        return np.array(attentionScoreExp,dtype=np.float32)
+        self.key_dim = model_dim if key_dim is None else key_dim
+        if model_dim <= 0 or self.key_dim <= 0:
+            raise ValueError('attention dimensions must be positive')
+        rng = rng if rng is not None else np.random.default_rng()
+        self.Q = rng.normal(0.0, 0.02, (model_dim, self.key_dim))
+        self.K = rng.normal(0.0, 0.02, (model_dim, self.key_dim))
+        self.V = rng.normal(0.0, 0.02, (model_dim, self.key_dim))
+        self.W_out = rng.normal(0.0, 0.02, (self.key_dim, model_dim))
+        self.params = {'Q': self.Q, 'K': self.K, 'V': self.V, 'out_weight': self.W_out}
+        self.grads = {name: np.zeros_like(value) for name, value in self.params.items()}
 
-    def computeAttention(self,wordEmbeddings):
-        computedQuery = wordEmbeddings @ self.Q
-        computedKey = wordEmbeddings @ self.K
-        computedValue = wordEmbeddings @ self.V
-        attentionScores = (computedQuery @ computedKey.T)
-        attentionScores = attentionScores / math.sqrt(self.key_dim)
-        scores = np.tril(np.ones(attentionScores.shape),k=0)
-        attentionScores = np.where(scores, attentionScores,-np.inf)
-        AttentionWeights = self.calculateExponential(attentionScores)
-        context = AttentionWeights @ computedValue
-        return context
+    def calculateExponential(self, attentionScores):
+        shifted = attentionScores - attentionScores.max(axis=-1, keepdims=True)
+        exp = np.exp(shifted)
+        return exp / exp.sum(axis=-1, keepdims=True)
+
+    def computeAttention(self, wordEmbeddings):
+        self.input = wordEmbeddings
+        self.query = matmul(wordEmbeddings, self.Q)
+        self.key = matmul(wordEmbeddings, self.K)
+        self.value = matmul(wordEmbeddings, self.V)
+        scores = matmul(self.query, self.key.T) / np.sqrt(self.key_dim)
+        self.mask = np.tril(np.ones(scores.shape, dtype=bool))
+        self.weights = self.calculateExponential(np.where(self.mask, scores, -np.inf))
+        self.context = matmul(self.weights, self.value)
+        return matmul(self.context, self.W_out)
+
+    def forward(self, x):
+        return self.computeAttention(x)
+
+    def backward(self, grad_output):
+        self.grads['out_weight'] += matmul(self.context.T, grad_output)
+        grad_context = matmul(grad_output, self.W_out.T)
+        grad_weights = matmul(grad_context, self.value.T)
+        grad_value = matmul(self.weights.T, grad_context)
+        grad_scores = self.weights * (
+            grad_weights - (grad_weights * self.weights).sum(axis=-1, keepdims=True)
+        )
+        grad_scores = np.where(self.mask, grad_scores, 0.0) / np.sqrt(self.key_dim)
+        grad_query = matmul(grad_scores, self.key)
+        grad_key = matmul(grad_scores.T, self.query)
+        self.grads['Q'] += matmul(self.input.T, grad_query)
+        self.grads['K'] += matmul(self.input.T, grad_key)
+        self.grads['V'] += matmul(self.input.T, grad_value)
+        return (matmul(grad_query, self.Q.T) + matmul(grad_key, self.K.T)
+                + matmul(grad_value, self.V.T))
 
 
-
-if __name__ == "__main__":
-    text = "the cat sat on the mat"
-    EmbeddingCls = ConvertToEmbeddings()
-    embeddedText = EmbeddingCls.embedText(text)
-    rows,cols = embeddedText.shape[0],embeddedText.shape[1]
-    AttentionCls = ComputeAttention(model_dim=cols)
-    ret = AttentionCls.computeAttention(embeddedText)
-    LinearMlp = MLP(ret.shape[0],ret.shape[1],bias=True)
-    output = LinearMlp.forward(ret)
-    # Token ID 0 means "a", 1 means "b", etc.
-    vocabulary = "abcdefghijklmnopqrstuvwxyz"
-    vocab_size = len(vocabulary)
-    model_dim = output.shape[-1]
+if __name__ == '__main__':
+    text = 'the cat sat on the mat'
     rng = np.random.default_rng(42)
-    W_vocab = rng.normal(
-        loc=0.0,
-        scale=0.02,
-        size=(model_dim, vocab_size),
-    )
-    logits = output @ W_vocab
-    next_character_scores = logits[-1]
-    next_character_id = int(np.argmax(next_character_scores))
-    next_character = vocabulary[next_character_id]
-
-    print("Next character:", next_character)
-    print("Updated text:", text + next_character)
-
-
-
-
-
-
-
-        
+    embeddedText = ConvertToEmbeddings().embedText(text)
+    print(embeddedText)
+    rows, cols = embeddedText.shape
+    print(embeddedText.shape)
+    attention = ComputeAttention(cols, rng=rng)
+    mlp = MLP(rows, cols, bias=True, rng=rng)
+    x = embeddedText + attention.forward(LayerNorm(cols).forward(embeddedText))
+    x = x + mlp.forward(LayerNorm(cols).forward(x))
+    output = LayerNorm(cols).forward(x)
+    vocabulary = 'abcdefghijklmnopqrstuvwxyz'
+    W_vocab = rng.normal(0.0, 0.02, (cols, len(vocabulary)))
+    logits = matmul(output, W_vocab)
+    next_character = vocabulary[int(np.argmax(logits[-1]))]
+    print('Output shape:', output.shape)
+    print('Next character (untrained):', next_character)
+    print('Updated text:', text + next_character)
